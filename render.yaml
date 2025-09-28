@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: novnc-bot
+    env: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt && playwright install chromium"
+    startCommand: "python bot.py"
+    envVars:
+      - key: NOVNC_URL
+        value: https://gdv9fx-6080.csb.app/vnc.html
+      - key: PASSWORD
+        value: DzD@987654321
