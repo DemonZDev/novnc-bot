@@ -1,134 +1,120 @@
-# bot.py
 import asyncio
+import os
+import time
 from playwright.async_api import async_playwright
 from fastapi import FastAPI
 import uvicorn
-import os
-import threading
 
-# === Config ===
+# ================== CONFIG ==================
 NOVNC_URL = os.getenv("NOVNC_URL", "https://gdv9fx-6080.csb.app/vnc.html")
 PASSWORD = os.getenv("PASSWORD", "DzD@987654321")
-HEALTH_PORT = int(os.getenv("PORT", 10000))
+REFRESH_INTERVAL = int(os.getenv("REFRESH_INTERVAL", "300"))  # seconds
+PORT = int(os.getenv("PORT", "10000"))  # Render assigns a port
+# ============================================
 
-# === FastAPI health server ===
 app = FastAPI()
 
 @app.get("/health")
-async def health():
-    return {"status": "ok"}
+def health_check():
+    """Render health check endpoint"""
+    return {"status": "ok", "time": time.time()}
 
 
-def start_api():
-    """Run FastAPI health server in background thread"""
-    uvicorn.run(app, host="0.0.0.0", port=HEALTH_PORT, log_level="warning")
+async def handle_vm_recovery(page):
+    """
+    If workspace reloads & VM needs restart:
+    Run the script → select options → wait until it's alive.
+    """
+    print("[VM] Attempting recovery sequence...")
+    try:
+        await page.fill("textarea", "bash <(curl -fsSL https://raw.githubusercontent.com/hopingboyz/vms/main/vm.sh)")
+        await page.keyboard.press("Enter")
+        await asyncio.sleep(10)
+
+        # Choose option 2 (start a VM)
+        await page.keyboard.type("2")
+        await page.keyboard.press("Enter")
+        await asyncio.sleep(5)
+
+        # Choose option 1 (select VM)
+        await page.keyboard.type("1")
+        await page.keyboard.press("Enter")
+
+        print("[VM] VM restart command sent, waiting ~90s...")
+        await asyncio.sleep(90)
+    except Exception as e:
+        print(f"[VM] Recovery failed: {e}")
 
 
-# === Bot Core ===
-async def run_bot():
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = await browser.new_context()
-        page = await context.new_page()
+async def connect_and_refresh():
+    """
+    Main bot loop:
+    - Connect to NoVNC
+    - Login
+    - Refresh Firefox tabs every REFRESH_INTERVAL
+    - Handle disconnections & run VM recovery if needed
+    """
+    while True:  # infinite outer loop → restart-safe
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox", "--disable-dev-shm-usage"]
+                )
+                context = await browser.new_context()
+                page = await context.new_page()
 
-        # ---------- Helpers ----------
-        async def wait_and_click(selector, timeout=5000):
-            try:
-                await page.wait_for_selector(selector, timeout=timeout)
-                await page.click(selector)
-                return True
-            except:
-                return False
+                print(f"[BOT] Connecting to {NOVNC_URL}")
+                await page.goto(NOVNC_URL, wait_until="domcontentloaded")
 
-        async def connect_vnc():
-            """Ensure NoVNC connection"""
-            while True:
-                print("[INFO] Opening NoVNC page...")
-                await page.goto(NOVNC_URL)
+                # Login if required
+                if await page.is_visible("input[type='password']"):
+                    await page.fill("input[type='password']", PASSWORD)
+                    await page.press("input[type='password']", "Enter")
+                    print("[BOT] Logged into NoVNC.")
 
-                # Click Connect
-                await wait_and_click("text=Connect", timeout=10000)
+                while True:  # inner loop → tab refresh cycle
+                    try:
+                        print("[BOT] Running refresh cycle...")
+                        tabs = context.pages
 
-                # Handle password
-                try:
-                    await page.fill("input[type='password']", PASSWORD, timeout=5000)
-                    await page.click("text=Send Password")
-                except:
-                    pass
+                        for i, tab in enumerate(tabs):
+                            url = tab.url
+                            if "idx.google.com" in url:
+                                print(f"[BOT] Refreshing tab {i+1}: {url}")
+                                await tab.reload(wait_until="domcontentloaded")
+                                await asyncio.sleep(5)
 
-                # Success check: Firefox visible
-                try:
-                    await page.wait_for_selector("text=Firefox", timeout=20000)
-                    print("[INFO] Connected to NoVNC desktop")
-                    return
-                except:
-                    print("[WARN] Connect failed, retrying...")
-                    await asyncio.sleep(5)
+                        print(f"[BOT] Sleeping {REFRESH_INTERVAL}s...")
+                        await asyncio.sleep(REFRESH_INTERVAL)
 
-        async def restart_vm():
-            """Restart VM from terminal"""
-            print("[WARN] VM appears stopped → restarting...")
-            await page.keyboard.type(
-                "bash <(curl -fsSL https://raw.githubusercontent.com/hopingboyz/vms/main/vm.sh)"
-            )
-            await page.keyboard.press("Enter")
-            await asyncio.sleep(3)
+                    except Exception as e:
+                        print(f"[BOT] Error during cycle: {e}")
+                        if "Disconnected" in str(e) or "reconnect" in str(e).lower():
+                            print("[BOT] NoVNC disconnected. Trying reload...")
+                            try:
+                                await page.click("text=Reload Window")
+                            except:
+                                try:
+                                    await page.click("text=Try Again")
+                                    await handle_vm_recovery(page)
+                                except:
+                                    print("[BOT] Reload failed, forcing reconnect...")
+                                    break  # go to outer loop
+                            await asyncio.sleep(10)
+                        else:
+                            raise e
 
-            await page.keyboard.type("2")
-            await page.keyboard.press("Enter")
-            await asyncio.sleep(2)
+        except Exception as e:
+            print(f"[BOT] Fatal error: {e}. Restarting in 30s...")
+            await asyncio.sleep(30)
 
-            await page.keyboard.type("1")
-            await page.keyboard.press("Enter")
 
-            print("[INFO] VM restarting, waiting 90s...")
-            await asyncio.sleep(90)
-            print("[INFO] VM restart complete")
-
-        async def refresh_tabs():
-            """Cycle through tabs and refresh"""
-            print("[INFO] Starting refresh cycle...")
-            tab_count = 0
-
-            for i in range(10):  # assume max 10 tabs
-                await page.keyboard.press("F5")
-                tab_count += 1
-                print(f"[INFO] Refreshed tab {i+1}")
-                await asyncio.sleep(3)
-
-                # Switch to next tab
-                await page.keyboard.down("Control")
-                await page.keyboard.press("PageDown")
-                await page.keyboard.up("Control")
-                await asyncio.sleep(1)
-
-            print(f"[INFO] Refreshed {tab_count} tabs. Sleeping 5 minutes...")
-            await asyncio.sleep(300)
-
-        # ---------- Main Loop ----------
-        while True:
-            try:
-                await connect_vnc()
-                await refresh_tabs()
-            except Exception as e:
-                print(f"[ERROR] {e}")
-
-                # Try workspace/VM recovery
-                if await page.query_selector("text=Reload Window"):
-                    print("[WARN] Disconnected popup → Reloading")
-                    await page.click("text=Reload Window")
-                elif await page.query_selector("text=Try Again"):
-                    print("[WARN] Error page → Try Again")
-                    await page.click("text=Try Again")
-                elif await page.query_selector("text=HOPINGBOYZ"):
-                    await restart_vm()
-
-                await asyncio.sleep(5)
+def start_bot():
+    loop = asyncio.get_event_loop()
+    loop.create_task(connect_and_refresh())
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
 
 
 if __name__ == "__main__":
-    # Start API server in background thread
-    threading.Thread(target=start_api, daemon=True).start()
-
-    # Start bot loop
-    asyncio.run(run_bot())
+    start_bot()
